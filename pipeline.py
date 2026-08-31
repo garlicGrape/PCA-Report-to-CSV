@@ -20,7 +20,8 @@ from langsmith import traceable
 from schema import PROPERTY_FIELDS, SYSTEM_FIELDS, COMPONENT_FIELDS
 from extract import extract
 from validate import (deterministic_checks, reconciliation_checks,
-                      grounding_checks, collect_suspect_property_fields)
+                      grounding_checks, collect_suspect_property_fields,
+                      completeness_checks)
 from judge import judge_fields
 
 HERE = Path(__file__).parent
@@ -37,6 +38,27 @@ def _write_csv(path: Path, fieldnames: list[str], rows: list[dict]):
         w.writerows(rows)
 
 
+def _stamp_keys(record: dict, stem: str, pdf_path: str):
+    """Put property_id + provenance on all three tables so they join."""
+    pid = _property_id(stem)
+    record["property"]["property_id"] = {"value": pid, "page": None,
+                                         "snippet": None, "confidence": 1.0}
+    record["property"]["source_file"] = {"value": Path(pdf_path).name, "page": None,
+                                         "snippet": None, "confidence": 1.0}
+    firm = record["property"].get("report_firm", {}).get("value")
+    for row in record["systems"]:
+        row["property_id"], row["report_firm"] = pid, firm
+    for row in record["components"]:
+        row["property_id"], row["report_firm"] = pid, firm
+    return record
+
+
+def _property_id(stem: str) -> str:
+    """Stable, filesystem-safe id derived from the filename."""
+    import re
+    return re.sub(r"[^A-Za-z0-9]+", "_", stem).strip("_")[:60]
+
+
 def _write_all(record: dict, stem: str, dest: Path):
     prop_row = {f: record["property"][f].get("value") for f in PROPERTY_FIELDS}
     _write_csv(dest / f"{stem}_property.csv", PROPERTY_FIELDS, [prop_row])
@@ -50,9 +72,10 @@ def process(pdf_path: str) -> dict:
     pdf_path = str(pdf_path)
     stem = Path(pdf_path).stem
     record = extract(pdf_path)
+    record = _stamp_keys(record, stem, pdf_path)
 
     det = deterministic_checks(record)
-    recon = reconciliation_checks(record)
+    recon = reconciliation_checks(record) + completeness_checks(record)
     ground = grounding_checks(record, pdf_path)
     suspects = collect_suspect_property_fields(record, det, recon, ground)
 

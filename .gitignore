@@ -1,15 +1,84 @@
-# secrets — never commit
+# ─────────────────────────────────────────────────────────────────────────
+# SECRETS — never commit
+# ─────────────────────────────────────────────────────────────────────────
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*.json
+service-account*.json
 
-# python
+# ─────────────────────────────────────────────────────────────────────────
+# CLIENT DATA — never commit
+#
+# These are real Property Condition Assessment reports for real properties.
+# The PDFs, and everything derived from them, carry property addresses,
+# owner and lender names, and financial figures. None of it belongs on
+# GitHub, including the derived tables — a CSV of extracted addresses and
+# reserve budgets is the same confidential information as the PDF it came
+# from, just easier to read.
+# ─────────────────────────────────────────────────────────────────────────
+
+# source documents, wherever they land (any case, any folder)
+*.pdf
+*.PDF
+*.[pP][dD][fF]
+*.zip
+*.ZIP
+*.[zZ][iI][pP]
+
+# extracted / derived tables anywhere in the repo
+*.csv
+*.tsv
+*.parquet
+*.xlsx
+*.xls
+
+# everything under data/ except empty-dir placeholders
+# (inbox PDFs, cache, aggregate CSVs, debug dumps, needs_review flags)
+data/**
+!data/**/
+!data/**/.gitkeep
+
+# corpus survey: carries verbatim cover-page and cost-table text, so it is
+# client data even though it is only a CSV of metadata
+corpus_profile.csv
+
+# local scratch / ad-hoc analysis of the corpus
+scratchpad/
+
+# ─────────────────────────────────────────────────────────────────────────
+# Python
+# ─────────────────────────────────────────────────────────────────────────
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 .venv/
 venv/
+env/
+.ipynb_checkpoints/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg
 
-# generated data (synthetic PDFs, CSVs, review queue) — keep the empty dirs
-data/inbox/*
-data/output/*
-data/needs_review/*
-data/gold/*
-!data/**/.gitkeep
+# ─────────────────────────────────────────────────────────────────────────
+# Editors and OS
+# ─────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+*.log

@@ -30,10 +30,10 @@ load_dotenv()
 import anthropic
 from langsmith import traceable
 
-from extract import _sliced_pdf_b64, pdf_block, EFFORT
+from extract import _judge_pdf_b64, pdf_block, EFFORT, _stream_text
 
 MODEL = "claude-sonnet-5"  # can use a stronger model here than extraction if you like
-_client = anthropic.Anthropic()
+_client = anthropic.Anthropic(max_retries=6)   # see extract.py
 
 
 def _salvage_verdicts(raw: str, fields: list) -> dict:
@@ -79,18 +79,66 @@ def _salvage_verdicts(raw: str, fields: list) -> dict:
     return out
 
 
+# Which of a system row's fields the judge is shown and asked about. Not the
+# whole row: `assessed` and the money columns are what a reviewer checks, and
+# every extra key costs tokens in both directions.
+_JUDGED_SYSTEM_FIELDS = ("condition", "condition_secondary",
+                         "condition_rating_numeric", "rul_years",
+                         "action_required", "source_sections",
+                         "immediate_repairs_usd", "short_term_repairs_usd",
+                         "non_critical_repairs_usd", "replacement_reserves_usd")
+
+
+def _cited_pages(record: dict, fields: list[str]) -> tuple:
+    """The original PDF pages extraction cited for the fields under review.
+
+    These drive the judge's page slice. Only pages for the fields actually
+    being judged - citing every field's page would rebuild the whole document
+    and give back the cost this slice exists to save.
+    """
+    pages = {record.get(f, {}).get("page") for f in fields}
+    return tuple(sorted(p for p in pages if isinstance(p, int) and p > 0))
+
+
 @traceable(run_type="llm", name="judge_fields")
-def judge_fields(pdf_path: str, record: dict, fields: list[str]) -> dict:
-    if not fields:
+def judge_fields(pdf_path: str, record: dict, fields: list[str],
+                 systems: list | None = None,
+                 subcategories: tuple = ()) -> dict:
+    """Verify suspect property fields and suspect subcategory rows in ONE call.
+
+    Returns {key: {"ok", "corrected_value", "reason"}} where a key is either a
+    property field name or "sys:<subcategory>". Property keys are unchanged
+    from the previous contract, so existing callers keep working; the systems
+    verdicts are additive.
+
+    One call, not two. The expensive part of judging is putting the document
+    in front of the model, so a second call to check the subcategory rows
+    would roughly double the layer's cost to verify a handful of extra cells.
+    They go in the same request, after the same document block.
+    """
+    systems = systems or []
+    sys_keys = [f"sys:{c}" for c in subcategories]
+    keys = list(fields) + sys_keys
+    if not keys:
         return {}
+
     subset = {f: record.get(f, {}).get("value") for f in fields}
-    # same slice as extraction: full reports are 200+ pages / >32MB request cap
-    data = _sliced_pdf_b64(pdf_path)
+    by_sub = {r.get("subcategory"): r for r in systems}
+    sys_subset = {
+        c: {k: by_sub.get(c, {}).get(k) for k in _JUDGED_SYSTEM_FIELDS}
+        for c in subcategories
+    }
+
+    # A targeted slice - the front block plus the pages extraction cited for
+    # these fields - not the 90-page extraction slice. See the note on
+    # JUDGE_FRONT_PAGES in extract.py for the measurement behind this.
+    data = _judge_pdf_b64(pdf_path, _cited_pages(record, fields))
     instr = (
-        "Re-read the attached PCA report and verify these extracted fields. "
-        "For each, decide if the extracted value is correct per the report.\n\n"
-        f"Fields to verify (name: extracted_value):\n{json.dumps(subset, indent=2)}\n\n"
-        "Before overturning a value, note what these reports actually do - "
+        "Re-read the attached PCA report and verify the extracted values "
+        "below. For each, decide if it is correct per the report.\n\n"
+        + (f"PROPERTY fields to verify (name: extracted_value):\n"
+           f"{json.dumps(subset, indent=2)}\n\n" if fields else "")
+        + "Before overturning a value, note what these reports actually do - "
         "the judge is here to catch extraction errors, not to standardise "
         "wording:\n"
         "- A condition may be the firm's own word ('average', 'satisfactory', "
@@ -102,14 +150,38 @@ def judge_fields(pdf_path: str, record: dict, fields: list[str]) -> dict:
         "- num_stories, eul_years and rul_years may legitimately be ranges "
         "('1-4', '10-15') when a property has buildings of differing heights "
         "or a firm quotes a life span.\n\n"
-        "Return ONLY a JSON object mapping each field name to "
+        + (
+            "\n\nAlso verify these CONDITION SUBCATEGORY rows. Each is a "
+            "roll-up of the report's own sections onto a fixed 12-category "
+            "scheme, so check the roll-up as well as the values:\n"
+            f"{json.dumps(sys_subset, indent=2)}\n"
+            "- source_sections lists the report sections that were folded "
+            "into the row. Check they genuinely belong to that subcategory.\n"
+            "- Site/parking lighting belongs to site_improvements, not "
+            "electrical. Roof drainage and gutters belong to roofing; storm "
+            "and site drainage to site_improvements. Retaining walls, fencing "
+            "and signage to site_improvements. The emergency generator to "
+            "electrical.\n"
+            "- Costs must not be double counted across subcategories, and "
+            "replacement_reserves_usd is the WHOLE-TERM total for that "
+            "subcategory - a recurring item counts once per occurrence.\n"
+            "- Report each of these under the key \"sys:<subcategory>\". A "
+            "correction is the corrected ROW OBJECT (only the keys that "
+            "change), not a scalar.\n"
+            if subcategories else ""
+        )
+        + "\n\nReturn ONLY a JSON object with exactly these keys:\n"
+        + f"{json.dumps(keys)}\n"
+        + "Each key maps to "
         '{"ok": true|false, "corrected_value": <correct value or null>, '
         '"reason": <short reason citing the report>}. '
         "If the extracted value is right, ok=true and corrected_value=null."
     )
 
-    parts = []
-    with _client.messages.stream(
+    # Same mid-stream retry as extraction: an overloaded_error can arrive
+    # after the stream opens, where the SDK's max_retries does not reach.
+    streamed, resp = _stream_text(
+        "judge", pdf_path, client=_client,
         model=MODEL,
         # Thinking is on and it dominates this budget. Measured on Maybelle
         # Carter: 7,796 of 8,000 output tokens went to thinking, leaving 540
@@ -117,23 +189,19 @@ def judge_fields(pdf_path: str, record: dict, fields: list[str]) -> dict:
         # and all five verdicts were thrown away, taking a clean report to
         # needs_review over a verdict the model had partly produced. The floor
         # scales with the number of fields because each one carries a reason.
-        max_tokens=min(32000, 12000 + 1500 * len(fields)),
+        max_tokens=min(32000, 12000 + 1500 * len(keys)),
         # Same reason as extract.EFFORT: thinking and answer share one
         # ceiling, and here thinking took 7,796 of 8,000 tokens.
         output_config={"effort": EFFORT},
         messages=[{
             "role": "user",
-            # Document first and cache-marked so this send hits the cache
-            # written by the extraction calls; the field list varies and must
-            # come after it.
-            "content": [pdf_block(data), {"type": "text", "text": instr}],
+            # Document first, UNCACHED. This is the judge's own narrow
+            # slice, sent once per report and reused by nothing, so a cache
+            # entry would cost 1.25x to write and never be read back.
+            "content": [pdf_block(data, cache=False),
+                        {"type": "text", "text": instr}],
         }],
-    ) as stream:
-        for chunk in stream.text_stream:
-            parts.append(chunk)
-        resp = stream.get_final_message()
-
-    streamed = "".join(parts)
+    )
     final = "".join(b.text for b in resp.content
                     if getattr(b, "type", None) == "text")
     raw = (final if len(final) >= len(streamed) else streamed).strip()
@@ -147,7 +215,7 @@ def judge_fields(pdf_path: str, record: dict, fields: list[str]) -> dict:
         f"usage={getattr(resp, 'usage', None)}\n"
         f"blocks={[(getattr(b, 'type', '?'), len(getattr(b, 'text', '') or '')) for b in resp.content]}\n"
         f"streamed_chars={len(streamed)}\nfinal_chars={len(final)}\n"
-        f"chars={len(raw)}\nn_fields={len(fields)}\nfields={fields}\n\n{raw}")
+        f"chars={len(raw)}\nn_keys={len(keys)}\nkeys={keys}\n\n{raw}")
 
     def _parse(text):
         try:
@@ -169,16 +237,16 @@ def judge_fields(pdf_path: str, record: dict, fields: list[str]) -> dict:
     # is how a report with one genuinely suspect field ended up flagged for
     # five. Recover whatever verdicts are complete and leave only the rest
     # unresolved.
-    verdicts = _salvage_verdicts(raw, fields)
+    verdicts = _salvage_verdicts(raw, keys)
     if verdicts:
         print(f"[judge] output truncated (stop_reason={stop}) - recovered "
-              f"{len(verdicts)} of {len(fields)} verdict(s)", file=sys.stderr)
+              f"{len(verdicts)} of {len(keys)} verdict(s)", file=sys.stderr)
 
     # Fail SOFT on the remainder. The judge is a second-opinion layer, not the
     # extraction. If it can't answer, the affected fields stay unverified and
     # the report routes to needs_review - far better than discarding a
     # successful 12-minute extraction over a malformed verdict.
-    for f in fields:
+    for f in keys:
         verdicts.setdefault(f, {
             "ok": False, "corrected_value": None,
             "reason": f"judge returned no usable verdict "

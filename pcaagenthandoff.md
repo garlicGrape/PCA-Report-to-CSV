@@ -106,6 +106,106 @@ reports:
 | `--no-judge` + Claude Haiku 4.5 | $32 |
 | all three | ~$21 |
 
+## The 12-subcategory consolidation (4 Sep 2026)
+
+**What changed and why.** `systems.csv` was one row per numbered section, named
+by whatever the assessing firm called it: **3,771 rows carrying 1,216 distinct
+`system_name` strings** across 134 reports. "Exterior Walls" appears 55 times,
+"Building Frame" 42, and behind them sits a thousand-long tail of one-offs.
+That is not a feature — it is free text with a cost column attached, and it
+cannot be pooled across firms, which is the entire premise of
+leave-one-firm-out CV.
+
+It is now **exactly 12 rows per report**, one per ASTM E 2018 subcategory,
+defined once in `taxonomy.SUBCATEGORIES` / `SUBCATEGORY_SCOPE`:
+
+    site_improvements  structural_frame_foundation  building_envelope  roofing
+    mechanical_hvac    plumbing   electrical   vertical_transportation
+    fire_life_safety   interior_elements   accessibility
+    additional_considerations
+
+`systems.csv` is therefore a fixed-width **134 x 12 feature matrix**. A
+subcategory a report is silent on is a row with `assessed=false`, not a missing
+row — "not assessed" and "assessed and found fine" are different facts and only
+the flag separates them.
+
+**What did NOT change.** `components.csv` keeps every line item and every
+EUL / effective age / RUL triple. The timing layer's training set is untouched
+at 2,409 rows / 1,336 complete triples. Components gained a **derived**
+`subcategory` column on the same 12-value axis (`taxonomy.subcategory_for_
+component`, run in `validate.coerce_types`), so a line item and a condition
+rating finally join. Derived, never extracted: it costs no output tokens, is
+identical on every re-run, and every row's bucket traces to the rule that
+assigned it via `taxonomy.explain`.
+
+**Provenance survived the fold.** Each row's `source_sections` carries the
+firm's own section numbers and headings, joined with "; " — e.g.
+`"4.4.1 Roofing Materials (BUR); 4.4.2 Roof Drainage"`. Without it the
+regrouping would be unauditable.
+
+**The migration was free.** `batch.migrate_legacy_systems` folds a cached
+pre-subcategory record onto the twelve on load, so all 134 cached extractions
+adopted the new schema without a single API call. `python verify_offline.py`
+re-validates everything and rebuilds `data/aggregate/` at $0. Only future runs
+pay the cheaper extraction.
+
+**Mapping coverage.** 93.3% of the old system names land on one of the twelve.
+The residue is deliberate, not a gap: `Utilities` / `Utility Providers and
+Special Systems` (57 rows) describes who supplies water and power to the site,
+spans plumbing and electrical, and belongs cleanly to neither — forcing it into
+`electrical` would corrupt that feature on 57 rows to avoid an honest gap.
+`Regulatory Compliance`, `Unit Mix`, and `Property Configuration` are not
+building systems at all. These are dropped from the systems block and counted
+in the coverage report `verify_offline.py` prints every run.
+
+### Cost
+
+The consolidation cuts call A's output; the judge changes cut its input. The
+bill is dominated by putting the PDF in front of the model, which no schema
+change touches:
+
+**Measured with `count_tokens` over 6 reports** (free endpoint, no inference):
+the extraction slice averages **134K tokens**; the new judge slice averages
+**33K** — **0.25x**. Applied to the 127 reports that were judged:
+
+| | Input tokens | Rate | Cost |
+|---|---|---|---|
+| Judge, before | 8.9M cache-write + 6.4M cache-read | $2.50 / $0.20 per MTok | **~$23.6** |
+| Judge, after | ~4.2M uncached | $2.00 per MTok | **~$8.4** |
+
+Roughly **$15 a run**, and — more useful than the number — the judge's cost no
+longer depends on how long a report sat in the queue before reaching it.
+
+Three changes got there, and the third was a bug in the first two:
+
+| Lever | Effect |
+|---|---|
+| Judge sends front block + cited pages, not the 90-page slice | 0.25x the input tokens, measured |
+| Judge verifies subcategory rows in the SAME call | second opinion on conditions at no extra document send |
+| Judge's document block is `pdf_block(data, cache=False)` | its slice is sent once and reused by nothing; marking it cached is a straight 1.25x write penalty that never pays back |
+
+The systems consolidation itself is a **data-quality** change first. It cuts
+call A's output — 28 ragged rows become 12 — but call A's output is ~$14 of an
+~$88 run and the property fields dominate it, so do not expect the schema
+change alone to move the bill much. What it buys is a feature matrix that can
+be pooled across firms.
+
+**The judge's cache-miss was the real leak.** It re-sent the full extraction
+slice to verify two to five cover-page facts, and because the extraction cache
+is written with a 5-minute TTL while a report takes longer than that to work
+through, roughly 40% of those sends paid 1.25x to rewrite a ~121K-token
+document. Raising the TTL to 1h does NOT pay — the write premium on call A
+(2x vs 1.25x) costs more than it saves on the judge. Sending a smaller
+document does pay, and it makes the judge's cost independent of how long the
+queue happened to be. See `JUDGE_FRONT_PAGES` in `extract.py`.
+
+**Still on the table, not done here:** the Batch API is a flat 50% on
+everything and nothing in this pipeline is latency-sensitive. It needs the
+per-PDF flow (extract A -> extract B -> validate -> judge) restructured into
+three corpus-wide phases keyed by `custom_id`.
+
+---
+
 ## Working on this project (read first, in any editor)
 
 **Setup**

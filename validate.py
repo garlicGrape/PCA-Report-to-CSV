@@ -45,9 +45,12 @@ import pdfplumber
 from schema import (PROPERTY_FIELDS, PROPERTY_META, SYSTEM_META, CONDITIONS,
                     COMPONENT_META, RECONCILE_REL_TOL, CONFIDENCE_FLOOR,
                     RANGE_NUMBER_FIELDS, CATEGORY_SYNONYM_FIELDS,
-                    RANGE_COMPONENT_FIELDS, RESERVE_YEARS, YEAR_FIELDS,
+                    RANGE_COMPONENT_FIELDS, RANGE_SYSTEM_FIELDS,
+                    RESERVE_YEARS, YEAR_FIELDS,
                     FIRM_PATTERNS, CLIENT_NAMES, NEAR_TERM_TABLES,
                     US_STATES)
+from taxonomy import (SUBCATEGORIES, SUBCATEGORY_OTHER,
+                      subcategory_for_component)
 
 
 # ── number parsing ─────────────────────────────────────────────────────────
@@ -275,9 +278,43 @@ def deterministic_checks(record: dict) -> list[dict]:
         cell = prop.get(field) or {}
         issues += _meta_issues(cell.get("value"), meta, field, "property")
 
+    # SHAPE. systems is a fixed 12-row block, one row per subcategory. A
+    # missing or duplicated subcategory makes systems.csv ragged and silently
+    # breaks any join or pivot built on it, so it is a hard check rather than
+    # something downstream is expected to defend against.
+    seen = [r.get("subcategory") for r in record["systems"]
+            if r.get("subcategory") != SUBCATEGORY_OTHER]
+    missing = [c for c in SUBCATEGORIES if c not in seen]
+    dupes = sorted({c for c in seen if seen.count(c) > 1})
+    if missing:
+        issues.append({"where": "systems", "field": "subcategory",
+                       "kind": "shape",
+                       "detail": f"missing subcategory row(s): {missing}"})
+    if dupes:
+        issues.append({"where": "systems", "field": "subcategory",
+                       "kind": "shape",
+                       "detail": f"duplicate subcategory row(s): {dupes}"})
+
     for i, row in enumerate(record["systems"]):
         for field, meta in SYSTEM_META.items():
             issues += _meta_issues(row.get(field), meta, field, f"systems[{i}]")
+        # An unassessed row must be empty. A row carrying a condition or a
+        # cost while claiming the report never addressed the subcategory is
+        # a contradiction, and it is the shape a bad fold takes.
+        if row.get("assessed") is False:
+            carried = [f for f in ("condition", "condition_rating_numeric",
+                                   "action_required", "rul_years",
+                                   "immediate_repairs_usd",
+                                   "short_term_repairs_usd",
+                                   "non_critical_repairs_usd",
+                                   "replacement_reserves_usd")
+                       if row.get(f) is not None]
+            if carried:
+                issues.append(
+                    {"where": f"systems[{i}]", "field": "assessed",
+                     "kind": "contradiction",
+                     "detail": f"{row.get('subcategory')} marked not assessed "
+                               f"but carries {carried}"})
 
     for i, row in enumerate(record["components"]):
         for field, meta in COMPONENT_META.items():
@@ -296,6 +333,19 @@ def deterministic_checks(record: dict) -> list[dict]:
 _SPAN = re.compile(r"\s+(?:to|-|\u2013|/)\s+|\s*/\s*", re.I)
 _QUALIFIER = re.compile(r"\s*\([^)]*\)\s*$")
 
+# The same qualifier without brackets. The 12-subcategory rollup asks the model
+# to fold several of the firm's sections into one row, and when their ratings
+# differ it names WHERE the worse one applies: "poor at wood trim", "peeling at
+# pool shell" (Bell Deerwood). That is a correct reading - the rating is
+# "poor", the location is real information - but it is not part of the RATING,
+# and it failed the category check exactly as "fair (PVC roof)" used to.
+# No value in CONDITIONS contains any of these prepositions, so stripping at
+# one cannot eat a legitimate rating; and _strip_qualifier only accepts the
+# result when what remains is a rating we recognise.
+_LOCATIVE = re.compile(
+    r"\s+(?:at|in|on|near|along|around|throughout|beneath|behind|"
+    r"adjacent to|for|of)\s+\S.*$", re.I)
+
 
 def _strip_qualifier(part: str, synonyms: dict) -> str:
     """"fair (PVC roof)" -> "fair".
@@ -311,14 +361,19 @@ def _strip_qualifier(part: str, synonyms: dict) -> str:
     section 4)" loses its parenthetical while a value that is nothing but a
     parenthetical is left alone to fail loudly.
     """
-    stripped = _QUALIFIER.sub("", part).strip()
-    if not stripped or stripped == part:
-        return part
-    for piece in _SPAN.split(stripped):
-        piece = piece.strip().lower()
-        if piece and synonyms.get(piece, piece) not in CONDITIONS:
-            return part
-    return stripped
+    for pattern in (_QUALIFIER, _LOCATIVE):
+        stripped = pattern.sub("", part).strip()
+        if not stripped or stripped == part:
+            continue
+        if all(_recognised(piece, synonyms)
+               for piece in _SPAN.split(stripped) if piece.strip()):
+            return stripped
+    return part
+
+
+def _recognised(piece: str, synonyms: dict) -> bool:
+    piece = piece.strip().lower()
+    return bool(piece) and synonyms.get(piece, piece) in CONDITIONS
 
 
 def _split_spanning(part: str, synonyms: dict) -> list:
@@ -403,6 +458,30 @@ def _normalise_categories(record: dict) -> None:
                 if not new:
                     continue
                 joined = "; ".join(new)
+
+                # condition_secondary sometimes comes back as a FINDING rather
+                # than a rating - "corrosion at balcony railings", "stucco
+                # patches from water damage", "fully depreciated (asphalt)".
+                # The 12-subcategory rollup invites it: the row folds several
+                # of the firm's sections, so the model reaches for prose to say
+                # which part is worse.
+                #
+                # That content is real and worth keeping, but it is not a
+                # rating, and leaving it in a category-checked column sent four
+                # otherwise-sound reports to needs_review over a field that is
+                # secondary by definition and feeds no number downstream. So it
+                # is MOVED to `notes` rather than either kept or discarded.
+                # Rehomed only when no part of it is a recognised rating, so a
+                # real "good; fair" is never touched.
+                if (field == "condition_secondary" and layer != "property"
+                        and not any(n in CONDITIONS for n in new)):
+                    note = str(row.get("notes") or "").strip()
+                    row["notes"] = f"{note} [condition detail: {val}]".strip()
+                    row[field] = None
+                    print(f"[normalise] {layer}.{field} {val!r} is a finding, "
+                          f"not a rating - moved to notes", file=sys.stderr)
+                    continue
+
                 if joined != val:
                     if is_cell:
                         cell["value"] = joined
@@ -477,7 +556,8 @@ def _coerce_rows(record: dict) -> list[dict]:
     nothing and the uncertainty stays on the record.
     """
     losses = []
-    for layer, metas, ranges in (("systems", SYSTEM_META, {}),
+    for layer, metas, ranges in (("systems", SYSTEM_META,
+                                  RANGE_SYSTEM_FIELDS),
                                  ("components", COMPONENT_META,
                                   RANGE_COMPONENT_FIELDS)):
         for i, row in enumerate(record.get(layer) or []):
@@ -490,6 +570,14 @@ def _coerce_rows(record: dict) -> list[dict]:
             for field, (lo_f, hi_f) in ranges.items():
                 if row.get(field) is None and row.get(hi_f) is not None:
                     row[field] = row[hi_f]
+
+    # Re-derive the component subcategory from the FINAL description. extract()
+    # sets it at assembly time, but a record loaded from an older cache has no
+    # subcategory at all and coercion can rewrite a description on the way
+    # through. Deriving it last means the column always matches the text that
+    # is actually in the CSV, and re-running costs nothing.
+    for row in record.get("components") or []:
+        row["subcategory"] = subcategory_for_component(row.get("description"))
     return losses
 
 
@@ -745,11 +833,26 @@ def completeness_checks(record: dict) -> list[dict]:
     issues = []
     prop = record["property"]
 
-    if not record["systems"]:
+    # The twelve rows always exist now, so "empty" means every one of them
+    # came back unassessed - which is a failed extraction, not a report that
+    # assesses nothing. Checked on content, because the old `not
+    # record["systems"]` test can no longer ever be true and would have
+    # silently stopped catching anything.
+    assessed = [r for r in record["systems"] if r.get("assessed")]
+    if not assessed:
         issues.append({"where": "systems", "field": "n_rows", "kind": "empty",
-                       "detail": "no system rows extracted - either the report "
-                                 "has no condition summary (derive from "
-                                 "narrative) or extraction missed the table"})
+                       "detail": "all 12 subcategories came back unassessed - "
+                                 "either the report has no condition summary "
+                                 "(derive from narrative) or extraction missed "
+                                 "the table"})
+    elif len(assessed) < 4:
+        # Real reports assess most of the twelve. Four is a deliberately loose
+        # floor: Villa Oaks genuinely has no itemised assessment, so this is a
+        # flag for a human, not a rejection.
+        issues.append({"where": "systems", "field": "n_rows", "kind": "sparse",
+                       "detail": f"only {len(assessed)} of 12 subcategories "
+                                 f"assessed: "
+                                 f"{[r['subcategory'] for r in assessed]}"})
     if not record["components"]:
         issues.append({"where": "components", "field": "n_rows", "kind": "empty",
                        "detail": "no component rows extracted"})
@@ -1062,3 +1165,83 @@ def collect_suspect_property_fields(record, det_issues, recon_issues, ground_fai
                 and conf <= CONFIDENCE_FLOOR:
             suspects.add(field)
     return sorted(suspects)
+
+
+# The subcategories whose condition rating actually moves a downstream number.
+# The judge costs money per report, so it verifies the rows a reviewer would
+# check first rather than all twelve: these five carry the largest reserve
+# lines in the corpus and the ratings most often disagreed about.
+JUDGE_PRIORITY_SUBCATEGORIES = ("roofing", "mechanical_hvac",
+                                "building_envelope", "structural_frame_foundation",
+                                "site_improvements")
+
+
+def collect_suspect_system_rows(record, det_issues, max_rows: int = 4) -> list[str]:
+    """Subcategories worth an LLM-judge pass, worst first.
+
+    New with the 12-row systems layer. It was not worth judging the old
+    per-section rows - there were 28 of them per report, named differently by
+    every firm, and no way to say which mattered. Twelve canonical rows are
+    both few enough to judge affordably and comparable enough that a verdict
+    on "roofing" means the same thing across the corpus.
+
+    Returns subcategory slugs, capped at `max_rows`. The cap is the cost
+    control: each judged row adds tokens to a call that re-reads the PDF, and
+    the ranking below puts the rows most likely to be wrong at the front, so
+    truncating the tail loses the least.
+    """
+    flagged = {}
+
+    def _bump(sub, why, weight):
+        if not sub:
+            return
+        cur = flagged.get(sub)
+        if cur is None or weight > cur[0]:
+            flagged[sub] = (weight, why)
+
+    by_index = {i: r.get("subcategory")
+                for i, r in enumerate(record.get("systems") or [])}
+
+    # 1. anything the deterministic layer complained about - a contradiction,
+    #    an out-of-range cost, a condition word outside the vocabulary.
+    for issue in det_issues:
+        where = issue.get("where", "")
+        if not where.startswith("systems["):
+            continue
+        try:
+            idx = int(where[len("systems["):-1])
+        except ValueError:
+            continue
+        # `category` issues are usually spelling, not error: coercion runs
+        # CONDITION_SYNONYMS afterwards and resolves most of them (a report
+        # correctly stating "none" for a building with no elevators trips this
+        # and then normalises to "na"). Suspects are collected pre-coercion,
+        # so scoring these at 3 would let a spelling variant displace a real
+        # problem from the judge's cap of `max_rows`.
+        kind = issue.get("kind", "flagged")
+        _bump(by_index.get(idx), kind, 1 if kind == "category" else 3)
+
+    for row in record.get("systems") or []:
+        sub = row.get("subcategory")
+        if not row.get("assessed"):
+            continue
+        money = [row.get(f) for f in ("immediate_repairs_usd",
+                                      "short_term_repairs_usd",
+                                      "non_critical_repairs_usd",
+                                      "replacement_reserves_usd")]
+        has_money = any(isinstance(v, (int, float)) and v > 0 for v in money)
+        # 2. a costed row with no rating. The cost is the number that matters
+        #    and nothing corroborates it.
+        if has_money and row.get("condition") is None \
+                and row.get("condition_rating_numeric") is None:
+            _bump(sub, "costed but unrated", 2)
+        # 3. a folded row with no provenance - nothing to retrace it by.
+        elif has_money and not row.get("source_sections"):
+            _bump(sub, "costed with no source_sections", 2)
+        # 4. the high-value rows, checked when there is budget left over.
+        elif has_money and sub in JUDGE_PRIORITY_SUBCATEGORIES:
+            _bump(sub, "high-value subcategory", 1)
+
+    ranked = sorted(flagged.items(), key=lambda kv: (-kv[1][0], kv[0]))
+    return [sub for sub, _ in ranked[:max_rows]]
+

@@ -29,6 +29,8 @@ from validate import (deterministic_checks, reconciliation_checks,
                       resolve_firm_from_pdf)
 from pipeline import _stamp_keys
 import batch as B
+from batch import AGG
+from taxonomy import SUBCATEGORIES, SUBCATEGORY_OTHER
 
 HERE = Path(__file__).parent
 RAW = HERE / "data" / "cache" / "raw"
@@ -132,7 +134,7 @@ def _verify(raw_file, pdf):
             stale.write_text(json.dumps(out["flags"], indent=2))
         elif stale.exists():
             stale.unlink()
-        return out["meta"], len(ground), len(arith), len(in_text), pdf is None
+        return out, len(ground), len(arith), len(in_text), pdf is None
 
 
 def main():
@@ -141,10 +143,11 @@ def main():
     idx = _pdf_index()
     jobs = [(str(f), str(idx.get(f.stem)) if idx.get(f.stem) else None)
             for f in sorted(RAW.glob("*.json"))]
-    rows, n_ground, n_arith, n_text, no_pdf = [], 0, 0, 0, 0
+    results, rows, n_ground, n_arith, n_text, no_pdf = [], [], 0, 0, 0, 0
     with ProcessPoolExecutor(max_workers=8) as ex:
-        for meta, g, a, t, missing in ex.map(one, jobs):
-            rows.append(meta); n_ground += g; n_arith += a; n_text += t
+        for out, g, a, t, missing in ex.map(one, jobs):
+            results.append(out); rows.append(out["meta"])
+            n_ground += g; n_arith += a; n_text += t
             no_pdf += 1 if missing else 0
 
     clean = sum(1 for m in rows if m["status"] == "clean")
@@ -155,6 +158,45 @@ def main():
     if no_pdf:
         print(f"  ({no_pdf} extraction(s) have no PDF on disk - "
               f"verified as far as the cached record allows)")
+
+    # Rebuild the aggregate CSVs from what was just revalidated. This is what
+    # makes the 12-subcategory migration free: every cached extraction is
+    # folded onto the canonical axis by batch.migrate_legacy_systems on load,
+    # so the new schema reaches data/aggregate/ without a single API call.
+    tables = B.aggregate(results, include_flagged=True)
+    B.write_outputs(tables)
+    print(f"\n  wrote {AGG}/  properties {tables['properties'].shape}  "
+          f"systems {tables['systems'].shape}  "
+          f"components {tables['components'].shape}  "
+          f"capex_by_subcategory {tables['capex_by_subcategory'].shape}")
+
+    _subcategory_report(tables)
+
+
+def _subcategory_report(tables) -> None:
+    """What the twelve actually claimed, on both layers.
+
+    Printed every run on purpose. The failure mode this guards against is
+    silent: a firm with unfamiliar section headings enters the corpus, its
+    rows land nowhere, and systems.csv quietly loses a report's costs while
+    still looking like a well-formed 12-row block.
+    """
+    sysdf, comps = tables["systems"], tables["components"]
+    assessed = sysdf[sysdf["assessed"] == True]          # noqa: E712
+    print("\n  subcategory coverage (systems):")
+    for sub in SUBCATEGORIES:
+        rows = assessed[assessed["subcategory"] == sub]
+        n_rep = rows["property_id"].nunique()
+        money = rows["replacement_reserves_usd"].fillna(0).sum()
+        print(f"    {sub:30s} assessed in {n_rep:4d} reports   "
+              f"reserves ${money:,.0f}")
+
+    if "subcategory" in comps.columns and len(comps):
+        other = (comps["subcategory"] == SUBCATEGORY_OTHER).sum()
+        print(f"\n  components mapped: {len(comps) - other} of {len(comps)} "
+              f"({100 * (len(comps) - other) / max(1, len(comps)):.1f}%); "
+              f"{other} in '{SUBCATEGORY_OTHER}' "
+              f"(professional services and unmatched)")
 
 
 if __name__ == "__main__":

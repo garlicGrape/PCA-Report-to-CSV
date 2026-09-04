@@ -21,6 +21,7 @@ from schema import PROPERTY_FIELDS, SYSTEM_FIELDS, COMPONENT_FIELDS
 from extract import extract
 from validate import (deterministic_checks, reconciliation_checks,
                       grounding_checks, collect_suspect_property_fields,
+                      collect_suspect_system_rows,
                       completeness_checks)
 from judge import judge_fields
 
@@ -78,10 +79,28 @@ def process(pdf_path: str) -> dict:
     recon = reconciliation_checks(record) + completeness_checks(record)
     ground = grounding_checks(record, pdf_path)
     suspects = collect_suspect_property_fields(record, det, recon, ground)
+    sys_suspects = collect_suspect_system_rows(record, det)
 
-    verdicts = judge_fields(pdf_path, record["property"], suspects)
+    verdicts = judge_fields(pdf_path, record["property"], suspects,
+                            systems=record["systems"],
+                            subcategories=tuple(sys_suspects))
 
     unresolved = []
+    for c in sys_suspects:
+        v = verdicts.get(f"sys:{c}", {})
+        if v.get("ok") is True:
+            continue
+        fix = v.get("corrected_value")
+        row = next((r for r in record["systems"]
+                    if r.get("subcategory") == c), None)
+        if isinstance(fix, dict) and row is not None:
+            for k, val in fix.items():
+                if k in SYSTEM_FIELDS and k != "subcategory":
+                    row[k] = val
+        else:
+            unresolved.append({"field": f"systems.{c}",
+                               "reason": v.get("reason", "flagged")})
+
     for f in suspects:
         v = verdicts.get(f, {})
         if v.get("ok") is True:
@@ -104,7 +123,9 @@ def process(pdf_path: str) -> dict:
         _write_all(record, stem, REVIEW)
         (REVIEW / f"{stem}.flags.json").write_text(json.dumps(
             {"deterministic": det, "reconciliation": recon, "grounding": ground,
-             "property_suspects": suspects, "unresolved": unresolved}, indent=2))
+             "property_suspects": suspects,
+             "system_suspects": sys_suspects,
+             "unresolved": unresolved}, indent=2))
 
     return {"id": stem, "status": status,
             "systems_rows": len(record["systems"]),

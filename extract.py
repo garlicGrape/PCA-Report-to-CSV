@@ -50,7 +50,7 @@ Cross-firm work (v4), after reading all 132 unique reports in the inbox:
   in schema.py), and some are quoted in calendar years and in inflated
   dollars. All three are now handled explicitly rather than silently dropped.
 """
-import base64, io, json, re, sys
+import base64, hashlib, io, json, random, re, sys, time
 from functools import lru_cache
 from pathlib import Path
 
@@ -63,6 +63,16 @@ from pypdf import PdfReader, PdfWriter
 
 from schema import (PROPERTY_FIELDS, SYSTEM_FIELDS, COMPONENT_FIELDS,
                     MAX_PDF_PAGES, RESERVE_YEARS, CONDITIONS)
+from taxonomy import (SUBCATEGORIES, SUBCATEGORY_SCOPE, SUBCATEGORY_OTHER,
+                      classify_subcategory, subcategory_for_component)
+
+# The subcategory definition list the prompt shows the model, rendered from
+# taxonomy.SUBCATEGORY_SCOPE so the instructions cannot drift from the schema.
+# The old systems layer drifted into 1,216 distinct names precisely because
+# the prompt described the target in prose that nothing validated against.
+_SUBCAT_BLOCK = "\n".join(
+    f"     {i:>2}. {name} - {SUBCATEGORY_SCOPE[name]}"
+    for i, name in enumerate(SUBCATEGORIES, 1))
 
 # Confirm the current model name in the Anthropic console; strings roll over.
 MODEL = "claude-sonnet-5"
@@ -187,7 +197,12 @@ _MONEY_STRONG = 12
 _MONEY_WEAK = 6
 
 
-_client = anthropic.Anthropic()
+# max_retries above the SDK default of 2. A full-corpus run is ~4 hours of
+# continuous calls and the account has hit its usage limit mid-run before
+# (report 55 of 107). The SDK retries 429 and 5xx with exponential backoff, so
+# a higher ceiling rides out a short throttle instead of failing a report that
+# has already paid to upload its PDF.
+_client = anthropic.Anthropic(max_retries=6)
 
 
 class TruncatedOutput(ValueError):
@@ -433,7 +448,7 @@ def _sliced_pdf_b64(pdf_path: str, max_pages: int = MAX_PDF_PAGES) -> str:
     return _prepare_pdf(pdf_path, max_pages)[0]
 
 
-def pdf_block(data: str) -> dict:
+def pdf_block(data: str, cache: bool = True) -> dict:
     """The document content block, marked as a prompt-cache breakpoint.
 
     The same PDF is sent three times per report - extract call A, extract call
@@ -451,10 +466,12 @@ def pdf_block(data: str) -> dict:
     exceeding that - pass {"type": "ephemeral", "ttl": "1h"} instead, which
     costs more to write but cannot miss on a slow report.
     """
-    return {"type": "document",
-            "source": {"type": "base64", "media_type": "application/pdf",
-                       "data": data},
-            "cache_control": {"type": "ephemeral"}}
+    block = {"type": "document",
+             "source": {"type": "base64", "media_type": "application/pdf",
+                        "data": data}}
+    if cache:
+        block["cache_control"] = {"type": "ephemeral"}
+    return block
 
 
 _COMMON_RULES = """
@@ -572,44 +589,112 @@ Return ONLY a JSON object (no prose, no markdown fences) with exactly two keys:
      per-unit reserve or per-unit repair figure.
    - building_age_years: only if the report states it directly.
 
-2. "systems": an array, one object per assessed system, each with exactly:
+2. "systems": an array of EXACTLY 12 objects, in exactly this order, one per
+   subcategory. Each object has exactly these keys:
 {json.dumps(SYSTEM_FIELDS)}
    (property_id and report_firm may be null - they are filled in later.)
-   - Ratings marked with two X's: condition = the better rating,
-     condition_secondary = the worse. One X: condition_secondary = null.
-     Three or more marked: condition = the best, condition_secondary = the
-     rest joined with "; ".
-   - Blank cost cells are null, not 0. action_required "None" stays "None".
+
+   THE 12 SUBCATEGORIES AND WHAT EACH COVERS:
+{_SUBCAT_BLOCK}
+
+   - RETURN ALL 12, ALWAYS, EVEN IF THE REPORT IS SILENT ON SOME. This array
+     is a fixed-width row block, not a list of findings. For a subcategory the
+     report does not address at all: "assessed": false, condition null, all
+     costs null, notes null. For one it does address: "assessed": true.
+     "Not assessed" and "assessed and found fine" are different facts and the
+     `assessed` flag is the only thing that separates them - never drop a row
+     to mean absence and never invent a condition to fill one.
+   - `subcategory` is exactly the slug above. No other value is accepted.
+   - FOLD the report's own sections into these twelve. A firm's "3.4 Roofing",
+     "3.5 Roof Drainage" and "Roof Coverings" are all `roofing`. Record which
+     of the firm's sections you folded in - their numbers and headings, joined
+     with "; " - in `source_sections` ("3.4 Roofing; 3.5 Roof Drainage"). That
+     field is the audit trail back to the page; a reviewer who cannot retrace
+     a number cannot check it, so do not leave it null on an assessed row.
+   - WHERE THE BOUNDARIES ACTUALLY FALL. These are the folds that get made
+     wrongly, and the specification settles each one:
+       * Site lighting and exterior/parking-lot lighting -> site_improvements,
+         NOT electrical. Electrical is the building's service, distribution,
+         panels, wiring and the emergency generator.
+       * Roof drainage, gutters and downspouts -> roofing. Storm water and
+         site/surface drainage -> site_improvements. Both are "drainage".
+       * Retaining walls, perimeter walls, fencing and signage ->
+         site_improvements, NOT structural or envelope.
+       * Stairs, balconies and load-bearing walls -> structural_frame_foundation.
+         Exterior walls, cladding, windows, doors, sealants and waterproofing
+         -> building_envelope.
+       * The emergency generator -> electrical. For SENIOR HOUSING the
+         specification also names generators under additional_considerations
+         alongside nurse call and commercial kitchen/dining: put the generator
+         in electrical and note any senior-specific dependency in the
+         additional_considerations notes. Do not put its cost in both.
+       * Pools, laundry, commercial kitchen equipment, dining infrastructure
+         and nurse call -> additional_considerations. Interior common-area and
+         unit finishes, flooring, ceilings, cabinetry and appliances ->
+         interior_elements.
+       * A "Utilities" or "Utility Providers" section is usually about who
+         supplies the site. Distribute any actual findings into plumbing
+         (water, sewer, gas) or electrical (power service); if it is purely a
+         list of providers with no condition or cost, it belongs to no
+         subcategory - leave it out rather than forcing it into one.
+   - EVERY DOLLAR LANDS IN EXACTLY ONE SUBCATEGORY. The twelve rows are summed
+     and reconciled against the report's stated immediate and reserve totals,
+     so a cost counted in two subcategories breaks the tie-out just as badly
+     as one that is missed. When a section spans two subcategories, put the
+     cost where the WORK is, not where the section heading sits.
    - Split each row's costs the SAME WAY as the cost tables, into
      immediate_repairs_usd / short_term_repairs_usd /
      non_critical_repairs_usd / replacement_reserves_usd. Do not fold a
      short-term or non-critical figure into immediate_repairs_usd: the
      systems sum is reconciled against the report's stated immediate total,
      and folding makes it overshoot.
-   - replacement_reserves_usd is this system's total over the WHOLE term, and
-     this is the single most common systems-layer error. If the report shows a
-     per-occurrence cost for something that RECURS, add up the occurrences.
-     Verbatim example (Tetra Tech): "Asphalt Pavement Seal/Stripe ... $17,920"
-     with $17,920 landing in BOTH year 2 and year 7 - the correct figure for
-     that system is 35,840, not the 17,920 printed in the row. The same rule
-     as total_cost_usd on the cost tables: when a year schedule exists, the
-     year cells are authoritative over any printed per-row total.
+   - Blank cost cells are null, not 0. A subcategory the report assessed and
+     assigned no cost to has assessed=true and null costs - not 0.
+   - replacement_reserves_usd is this subcategory's total over the WHOLE term,
+     and this is the single most common systems-layer error. If the report
+     shows a per-occurrence cost for something that RECURS, add up the
+     occurrences. Verbatim example (Tetra Tech): "Asphalt Pavement
+     Seal/Stripe ... $17,920" with $17,920 landing in BOTH year 2 and year 7 -
+     the correct figure is 35,840, not the 17,920 printed in the row. Same
+     rule as total_cost_usd on the cost tables: when a year schedule exists,
+     the year cells are authoritative over any printed per-row total.
    - condition: same rule as overall_condition above - the report's own word,
-     lowercased, not translated onto a four-point scale.
-   - NUMERIC RATINGS: some firms (EMG) rate systems 1-5 instead of using words.
-     Put the number in condition_rating_numeric and leave condition null unless
-     the report ALSO prints a word for that row. Do NOT convert the number to a
-     word from memory - scales differ in direction between firms, and a report
-     that prints no legend does not tell you which way its scale runs. If the
-     report DOES print a legend ("1 - Excellent, 2 - Good ..."), you may fill
-     both the number and the word it maps to.
+     lowercased, not translated onto a four-point scale. When the folded
+     sections disagree (roofing "good", roof drainage "fair"), condition = the
+     BEST rating and condition_secondary = the rest joined with "; ", which is
+     the same convention as a two-X rating below.
+   - Ratings marked with two X's: condition = the better rating,
+     condition_secondary = the worse. One X: condition_secondary = null.
+     Three or more marked: condition = the best, condition_secondary = the
+     rest joined with "; ".
+   - NUMERIC RATINGS: some firms (EMG) rate 1-5 instead of using words. Put
+     the number in condition_rating_numeric and leave condition null unless
+     the report ALSO prints a word for that row. Do NOT convert the number to
+     a word from memory - scales differ in direction between firms, and a
+     report that prints no legend does not tell you which way its scale runs.
+     If the report DOES print a legend ("1 - Excellent, 2 - Good ..."), you
+     may fill both the number and the word it maps to. When folded sections
+     carry different numbers, use the WORST (highest-wear) number and say so
+     in notes.
+   - rul_years: the remaining useful life the report states for this
+     subcategory as a whole, most often printed for roofing. Null unless the
+     report states it - do NOT compute it from age and expected life, and do
+     not carry one component's RUL up to the whole subcategory. A negative
+     value is valid and means past its expected life; keep the sign.
+   - action_required: the report's own words, condensed ("Replace",
+     "Refurbish, Repair", "None"). When folding several sections, join the
+     distinct actions with "; ".
+   - notes: at most 25 words of the report's own findings for this
+     subcategory - what it is, what is wrong with it. Null when not assessed.
+     This is the only narrative that survives the fold, so spend it on the
+     finding, not on restating the subcategory name.
    - SOURCE: prefer the EXECUTIVE SUMMARY / "Project At a Glance" / "Physical
      Condition Summary" / "General Condition Description" table if the report
      has one. SOME FIRMS HAVE NO SUCH TABLE - Partner Engineering states
      conditions only in narrative ("The split systems appeared to be in good
-     condition"). In that case build one row per numbered narrative section
-     from the prose. NEVER return an empty systems array for a report that
-     assesses systems.
+     condition"). In that case fill the twelve rows from the prose. NEVER
+     return fewer than 12 objects, and never return a report's systems as an
+     empty array.
    - Some firms (LandScience, CBC) cost their work AT THIS LEVEL rather than
      in a component table: the section table carries "Immed. Cost" and
      "Reserve Cost" columns, or an "Action" cell holding numbered items with
@@ -797,6 +882,34 @@ items (table="reserve"). Do NOT emit any immediate or short-term rows in this
 call."""
 
 
+# ── prompt versioning ──────────────────────────────────────────────────────
+# A fingerprint of everything that decides what an extraction CONTAINS: both
+# instruction strings, the model, and the three field lists. Any edit to any of
+# them changes this hash.
+#
+# WHY IT EXISTS. The single worst problem in this corpus is documented in the
+# handoff: the 134 extractions were produced under roughly six different prompt
+# versions over one session, so extraction quality correlates with WHEN a report
+# happened to run - and because reports ran in firm-grouped batches, it
+# correlates with FIRM, which is the leave-one-firm-out CV axis. Nothing in the
+# cached records recorded which prompt produced them, so there was no way to
+# tell a stale extraction from a current one except by re-running everything.
+#
+# With the stamp, `batch.py` reuses a cached extraction only if it was produced
+# by the CURRENT prompt and re-extracts it otherwise. Two things follow:
+#   * A full re-extraction is RESUMABLE. The previous full run hit the account
+#     usage limit at report 55 of 107; restarting with --no-cache would have
+#     re-paid for all 55. Now the same command picks up where it stopped,
+#     because the finished reports carry a matching stamp.
+#   * "Extracted under one frozen prompt" becomes a checkable property of the
+#     dataset instead of a claim - see `batch.py --prompt-audit`.
+PROMPT_VERSION = hashlib.sha256("|".join([
+    _INSTRUCTIONS_A, _INSTRUCTIONS_B, MODEL,
+    ",".join(PROPERTY_FIELDS), ",".join(SYSTEM_FIELDS),
+    ",".join(COMPONENT_FIELDS),
+]).encode()).hexdigest()[:12]
+
+
 def _salvage_rows(raw: str) -> list:
     """Complete row objects recoverable from a truncated components array.
 
@@ -839,6 +952,63 @@ def _salvage_rows(raw: str) -> list:
     return rows
 
 
+# ── transient-failure retry ────────────────────────────────────────────────
+# The SDK's `max_retries` covers the INITIAL HTTP request only. An
+# `overloaded_error` can also arrive as an SSE event AFTER the stream has
+# opened, and the SDK raises it straight out of `for chunk in
+# stream.text_stream` with no retry - which is exactly how Brookdale Irving
+# died 73 reports into a 132-report run, having already paid to upload its PDF.
+#
+# So the retry has to wrap the whole stream, not the request. Re-running a
+# stream from scratch is safe: the call is idempotent, and the document block
+# is cache-marked, so a second attempt within the TTL re-reads the cache at a
+# tenth of input cost rather than re-uploading.
+STREAM_RETRIES = 4
+STREAM_BACKOFF = 8.0     # seconds, doubled each attempt, plus jitter
+
+
+def _is_transient(exc: Exception) -> bool:
+    """True for failures that a later identical request may survive."""
+    if isinstance(exc, (anthropic.APIConnectionError, anthropic.APITimeoutError,
+                        anthropic.RateLimitError,
+                        anthropic.InternalServerError)):
+        return True
+    if isinstance(exc, anthropic.APIStatusError):
+        code = getattr(exc, "status_code", None)
+        # 529 is Anthropic's overloaded status. A mid-stream overload can
+        # surface without a usable status code, so match the payload too.
+        if code is None or code >= 500:
+            return True
+        return "overloaded" in str(exc).lower()
+    return False
+
+
+def _stream_text(tag: str, pdf_path: str, client=None, **kwargs):
+    """-> (streamed text, final message). Retries transient failures.
+
+    Deliberately NOT catching TruncatedOutput or JSON problems: those are
+    deterministic properties of the response and retrying them just buys the
+    same answer twice. Only transport and capacity failures are retried.
+    """
+    name = Path(pdf_path).name
+    for attempt in range(1, STREAM_RETRIES + 1):
+        parts = []
+        try:
+            with (client or _client).messages.stream(**kwargs) as stream:
+                for chunk in stream.text_stream:
+                    parts.append(chunk)
+                return "".join(parts), stream.get_final_message()
+        except Exception as exc:
+            if attempt == STREAM_RETRIES or not _is_transient(exc):
+                raise
+            delay = STREAM_BACKOFF * (2 ** (attempt - 1)) + random.uniform(0, 3)
+            print(f"[{tag}] {name}: {type(exc).__name__} "
+                  f"({str(exc)[:70]}) after {len(''.join(parts))} chars - "
+                  f"retry {attempt}/{STREAM_RETRIES - 1} in {delay:.0f}s",
+                  file=sys.stderr)
+            time.sleep(delay)
+
+
 def _call(data: str, instructions: str, max_tokens: int, tag: str,
           pdf_path: str, effort: str = EFFORT) -> dict:
     """One API call returning parsed JSON, with truncation diagnostics.
@@ -848,8 +1018,8 @@ def _call(data: str, instructions: str, max_tokens: int, tag: str,
     mid-emission, which presents as an empty response with the full budget
     spent - indistinguishable from the model genuinely saying nothing.
     """
-    parts = []
-    with _client.messages.stream(
+    streamed, resp = _stream_text(
+        tag, pdf_path,
         model=MODEL,
         max_tokens=max_tokens,
         output_config={"effort": effort},
@@ -861,12 +1031,7 @@ def _call(data: str, instructions: str, max_tokens: int, tag: str,
             "content": [pdf_block(data),
                         {"type": "text", "text": instructions}],
         }],
-    ) as stream:
-        for chunk in stream.text_stream:
-            parts.append(chunk)
-        resp = stream.get_final_message()
-
-    streamed = "".join(parts)
+    )
     final = "".join(b.text for b in resp.content
                     if getattr(b, "type", None) == "text")
     raw = (final if len(final) >= len(streamed) else streamed).strip()
@@ -926,6 +1091,133 @@ def _components_split(data: str, pdf_path: str) -> dict:
                   f"should flag this report", file=sys.stderr)
             rows.extend(salvaged)
     return {"components": rows}
+
+
+def _normalise_systems(rows: list, pdf_path: str) -> list:
+    """Model output -> exactly 12 rows, one per subcategory, in canonical order.
+
+    The prompt asks for all twelve and the model usually complies, but a
+    fixed-width feature matrix cannot depend on that: one report returning
+    eleven rows turns systems.csv into a ragged table and every downstream
+    join has to defend against it. Enforcing the shape here - where it is
+    free and deterministic - is the difference between a schema and a hope.
+
+    Three things get repaired:
+      * a subcategory the model omitted becomes an unassessed row;
+      * an unknown or misspelled `subcategory` is re-mapped through the
+        taxonomy rules rather than discarded, so its costs survive;
+      * duplicate rows for one subcategory are merged, summing the money and
+        keeping the best condition, because dropping either copy would lose
+        cost that reconciliation is about to check.
+    """
+    by_sub, unknown, orphans = {}, [], []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        flat = {f: row.get(f) for f in SYSTEM_FIELDS}
+        sub = (flat.get("subcategory") or "").strip().lower().replace(" ", "_")
+        if sub == SUBCATEGORY_OTHER:
+            # Already known to belong to none of the twelve (the legacy
+            # migration says so explicitly). Not an anomaly - don't log it.
+            orphans.append(flat)
+            continue
+        if sub not in SUBCATEGORIES:
+            # Don't throw the row away - it may be carrying money. Re-map it
+            # from whatever the model did say, and record what happened.
+            guess = classify_subcategory(
+                " ".join(str(flat.get(k) or "") for k in
+                         ("subcategory", "source_sections", "notes")))
+            unknown.append((flat.get("subcategory"), guess))
+            if guess == SUBCATEGORY_OTHER:
+                # Belongs to none of the twelve. It is NOT dropped: it may be
+                # carrying cost, and the systems block is summed against the
+                # report's own stated totals. Dropping a costed row makes a
+                # correct extraction fail reconciliation - measured, when this
+                # function did drop them: 25 of 134 reports stopped tying out
+                # on "reserves: property vs systems" purely because rows like
+                # "Utilities" took their reserve dollars with them.
+                flat["subcategory"] = SUBCATEGORY_OTHER
+                orphans.append(flat)
+                continue
+            sub = guess
+        flat["subcategory"] = sub
+        if sub in by_sub:
+            by_sub[sub] = _merge_system_rows(by_sub[sub], flat)
+        else:
+            by_sub[sub] = flat
+
+    if unknown:
+        print(f"[extract] {Path(pdf_path).name}: re-mapped {len(unknown)} "
+              f"row(s) with an off-schema subcategory: {unknown[:5]}",
+              file=sys.stderr)
+
+    out = []
+    for sub in SUBCATEGORIES:
+        row = by_sub.get(sub)
+        if row is None:
+            row = {f: None for f in SYSTEM_FIELDS}
+            row["subcategory"] = sub
+            row["assessed"] = False
+        elif row.get("assessed") is None:
+            # The model filled the row but did not say. Content decides:
+            # anything at all on the row means the report addressed it.
+            row["assessed"] = any(
+                row.get(f) is not None for f in
+                ("condition", "condition_rating_numeric", "action_required",
+                 "rul_years", "notes", "source_sections",
+                 "immediate_repairs_usd", "short_term_repairs_usd",
+                 "non_critical_repairs_usd", "replacement_reserves_usd"))
+        out.append(row)
+
+    # The 13th row, present only when it has to be. It holds whatever mapped
+    # to none of the twelve AND carries money, so cost integrity survives the
+    # regrouping. The feature matrix is the twelve: filter with
+    # `subcategory != "other"` for modelling, keep it for any sum that has to
+    # tie out against the report.
+    if orphans:
+        merged = orphans[0]
+        for extra in orphans[1:]:
+            merged = _merge_system_rows(merged, extra)
+        if any(isinstance(merged.get(f), (int, float)) and merged[f]
+               for f in _MONEY_FIELDS):
+            merged["subcategory"] = SUBCATEGORY_OTHER
+            merged["assessed"] = True
+            out.append(merged)
+    return out
+
+
+_MONEY_FIELDS = ("immediate_repairs_usd", "short_term_repairs_usd",
+                 "non_critical_repairs_usd", "replacement_reserves_usd")
+
+
+def _merge_system_rows(a: dict, b: dict) -> dict:
+    """Two rows for one subcategory -> one. Money adds, text joins.
+
+    Summing rather than picking a winner: both rows are real costs the report
+    stated, and reconciliation compares the total against the report's own
+    stated total. Keeping one and dropping the other would under-sum and flag
+    a correct extraction.
+    """
+    out = dict(a)
+    for f in _MONEY_FIELDS:
+        va, vb = a.get(f), b.get(f)
+        vals = [v for v in (va, vb) if isinstance(v, (int, float))]
+        out[f] = sum(vals) if vals else (va if va is not None else vb)
+    for f in ("source_sections", "action_required", "notes"):
+        parts = [str(v).strip() for v in (a.get(f), b.get(f))
+                 if v not in (None, "")]
+        # dict.fromkeys dedupes while keeping order
+        out[f] = "; ".join(dict.fromkeys(parts)) or None
+    for f in ("condition", "condition_secondary", "condition_rating_numeric",
+              "rul_years"):
+        out[f] = a.get(f) if a.get(f) is not None else b.get(f)
+    # None, not False, when neither row said - otherwise the merged row
+    # skips the content-based inference in _normalise_systems and a row
+    # carrying real money comes out marked "not assessed".
+    flags = [r.get("assessed") for r in (a, b)]
+    out["assessed"] = True if any(f is True for f in flags) else (
+        None if all(f is None for f in flags) else False)
+    return out
 
 
 @traceable(run_type="llm", name="extract_pca")
@@ -990,8 +1282,7 @@ def extract(pdf_path: str) -> dict:
                    # confidence, so None simply lets the other layers decide.
                    "confidence": cell.get("confidence")}
 
-    systems = [{f: row.get(f) for f in SYSTEM_FIELDS}
-               for row in (a.get("systems") or [])]
+    systems = _normalise_systems(a.get("systems") or [], pdf_path)
     # Expand the sparse wire format back into the flat schema: the model
     # omits nulls and collapses the 12 year columns into a "years" dict,
     # which cuts its output several-fold and keeps long tables under the
@@ -1017,6 +1308,11 @@ def extract(pdf_path: str) -> dict:
                     continue
                 if 1 <= idx <= RESERVE_YEARS:
                     flat[f"year_{idx}"] = v
+        # Derived here, not asked for: deterministic, free, and traceable
+        # to the rule that assigned it (taxonomy.explain). Recomputed by
+        # validate.coerce_types after description coercion in case the
+        # description changed.
+        flat["subcategory"] = subcategory_for_component(flat.get("description"))
         if flat.get("rul_varies") is None:
             flat["rul_varies"] = False
         if flat.get("years_inflated") is None:
@@ -1030,4 +1326,95 @@ def extract(pdf_path: str) -> dict:
               f"converted to term years; those schedules will under-sum.",
               file=sys.stderr)
 
-    return {"property": prop, "systems": systems, "components": components}
+    return {"property": prop, "systems": systems, "components": components,
+            "_prompt_version": PROMPT_VERSION}
+
+# ── judge slice ────────────────────────────────────────────────────────────
+# The judge's page budget. Distinct from the extraction slice on purpose.
+#
+# WHY: the judge re-sent the FULL extraction slice - a 90-page, ~121K-token
+# document - to verify two to five scalar fields. Measured over 127 judged
+# reports that was 15.3M input tokens, and because the extraction cache is
+# written with a 5-minute TTL while a report takes longer than that to work
+# through, roughly 40% of those sends missed the cache and paid 1.25x to
+# rewrite the whole document. The judge was ~27% of the run for verdicts on a
+# handful of cover-page facts.
+#
+# The fields the judge is actually asked about - report_firm, assessment_date,
+# inflation_rate_pct, the reserve and repair totals, overall_condition, the
+# subcategory conditions - live in the cover, the executive summary and the
+# condition-summary table. So the judge gets the front block plus the pages
+# extraction cited for the fields under review, and nothing else.
+#
+# The tradeoff is deliberate and worth stating: this slice cannot hit the
+# extraction cache, because it is a different document. It is cheaper anyway -
+# ~20 uncached pages beats ~90 pages at a 60% cache-hit rate by a wide margin -
+# and it stops the judge's cost depending on how long the queue happened to be.
+JUDGE_FRONT_PAGES = 14
+JUDGE_MAX_PAGES = 26
+
+# Raw-bytes ceiling for the judge slice, well under the API's request cap.
+# Not a safety margin - a cost control. A cited page can land in a photo
+# appendix: on the 239-page Canal Square report (46.9MB), the front 14 pages
+# weigh 0.37MB while two arbitrary interior pages plus neighbours pushed the
+# slice to 7.9MB. One mis-cited page would cost more than the whole-document
+# send this slice exists to avoid, so heavy cited pages get dropped and the
+# front block - which is where the judged facts live - is what survives.
+JUDGE_MAX_BYTES = 4 * 1024 * 1024
+
+
+@lru_cache(maxsize=8)
+def _judge_pdf_b64(pdf_path: str, cited: tuple = ()) -> str:
+    """-> base64 of a small slice: the front block plus the cited pages.
+
+    `cited` is 1-based ORIGINAL page numbers, as stored on the extracted
+    cells. Out-of-range values are ignored rather than raising: a page number
+    is exactly the thing a bad extraction gets wrong, and the judge exists to
+    catch that, so it must still run when the citation is nonsense.
+
+    Each cited page brings its neighbours. A value read from the top of a
+    table is often stated in the line above it, and a one-page window makes
+    the judge answer "not stated" for something the report states plainly.
+    """
+    reader = PdfReader(pdf_path)
+    total = len(reader.pages)
+
+    keep = set(range(min(JUDGE_FRONT_PAGES, total)))
+    for pg in cited:
+        if not isinstance(pg, int):
+            continue
+        i = pg - 1
+        if 0 <= i < total:
+            keep.update(j for j in (i - 1, i, i + 1) if 0 <= j < total)
+
+    front = set(range(min(JUDGE_FRONT_PAGES, total)))
+    idxs = sorted(keep)[:JUDGE_MAX_PAGES]
+    data, size = _encode(reader, idxs, pdf_path)
+    if size <= JUDGE_MAX_BYTES:
+        return data
+
+    # Over budget. Weigh each cited page on its own and drop the heaviest
+    # until it fits, never touching the front block. Photo pages weigh
+    # megabytes and text pages weigh kilobytes, so this converges in a step
+    # or two and removes exactly the pages that were not worth sending.
+    def _page_bytes(i):
+        w = PdfWriter()
+        w.add_page(reader.pages[i])
+        buf = io.BytesIO()
+        w.write(buf)
+        return len(buf.getvalue())
+
+    extra = sorted((i for i in idxs if i not in front),
+                   key=_page_bytes, reverse=True)
+    dropped = []
+    while extra and size > JUDGE_MAX_BYTES:
+        heaviest = extra.pop(0)
+        dropped.append(heaviest)
+        idxs = [i for i in idxs if i != heaviest]
+        data, size = _encode(reader, idxs, pdf_path)
+
+    print(f"[judge-pages] {Path(pdf_path).name}: slice over "
+          f"{JUDGE_MAX_BYTES / 1e6:.0f}MB - dropped {len(dropped)} heavy cited "
+          f"page(s) {[i + 1 for i in dropped][:8]}; kept {len(idxs)} page(s) "
+          f"at {size / 1e6:.1f}MB", file=sys.stderr)
+    return data

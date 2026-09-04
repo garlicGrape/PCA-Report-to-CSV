@@ -3,7 +3,9 @@ Schema built from the actual EBI Consulting PCR structure (ASTM E 2018-15).
 Three record types per report:
 
   PROPERTY   one row  — identity, metadata, summary totals
-  SYSTEMS    ~20 rows — one per numbered section (2.1..5.2): condition + costs
+  SYSTEMS    exactly 12 rows — one per canonical subcategory (see
+                         taxonomy.SUBCATEGORIES): condition + costs + RUL.
+                         Fixed width, so this is a feature matrix, not a list.
   COMPONENTS many rows — Table 1 (immediate) + Table 2 (reserves) line items,
                          including EUL / effective age / RUL per component.
                          This is the timing layer's training data.
@@ -16,6 +18,8 @@ Widened after reading the full 132-report corpus: 16 firms and 9 distinct
 cost-table layouts, not 4 and 4. See FIRM_PATTERNS and the shape catalogue
 further down for what that cost in schema terms.
 """
+
+from taxonomy import SUBCATEGORIES, SUBCATEGORY_OTHER
 
 # ── CONDITION VOCABULARY ───────────────────────────────────────────────────
 # Two lists, deliberately. CONDITIONS is everything a firm is allowed to say;
@@ -257,12 +261,28 @@ RANGE_NUMBER_FIELDS = {
     "num_stories": ("num_stories_min", "num_stories_max"),
 }
 
-# ── SYSTEMS (one row per numbered section) ─────────────────────────────────
-# From the Executive Summary Table: 2.1 Topography .. 5.2 Fire Department.
+# ── SYSTEMS (exactly one row per canonical subcategory) ────────────────────
+# CHANGED: this layer used to be one row per numbered section, keyed on
+# whatever the assessing firm called it. Across 134 reports that produced
+# 3,771 rows carrying 1,216 DISTINCT system_name strings - "Exterior Walls",
+# "Building Frame", "Foundation/Substructure" and a thousand-long tail of
+# one-offs. It could not be pooled across firms, which is the premise of
+# leave-one-firm-out CV, so it was free text with a cost column attached
+# rather than a feature.
+#
+# It is now the twelve ASTM E 2018 subcategories in taxonomy.SUBCATEGORIES,
+# emitted for EVERY report whether or not the report addresses them. A fixed
+# 12-row block per report makes systems.csv a 134 x 12 feature matrix. A
+# subcategory the report is silent on is a row with a null condition, not a
+# missing row: "this report does not assess vertical transportation" is a real
+# observation and an absent row cannot carry it.
+#
+# Costs still reconcile. reconciliation_checks sums these rows against the
+# property-level stated totals exactly as before - the sum is over twelve rows
+# instead of twenty-eight, and is unaffected by the regrouping.
 SYSTEM_FIELDS = [
     "property_id", "report_firm",          # join keys, filled by the pipeline
-    "section_code",            # "3.4"
-    "system_name",             # "Roofing"
+    "subcategory",             # one of taxonomy.SUBCATEGORIES
     "condition",               # primary rating (lowercase)
     "condition_secondary",     # second X when rated e.g. "Good to Fair", else null
     "condition_rating_numeric",# firms that rate on a 1-5 scale (EMG) instead of
@@ -274,6 +294,16 @@ SYSTEM_FIELDS = [
                                # numeric. Kept as a number, mapped only when a
                                # report states its own legend.
     "action_required",         # verbatim-ish: "Replace", "Refurbish, Repair", "None"
+    "rul_years",               # remaining useful life for the subcategory as a
+                               # whole where the report states one. The spec
+                               # calls for it explicitly under roofing; firms
+                               # state it for other subcategories too and it is
+                               # the single most useful number on the row.
+                               # NEGATIVE IS VALID - see the COMPONENT_META
+                               # note on rul_years; a subcategory past its
+                               # expected life is exactly the deferred-
+                               # maintenance signal the timing layer wants.
+    "rul_years_min", "rul_years_max",   # see RANGE_SYSTEM_FIELDS
     "immediate_repairs_usd",   # from the exec summary row; null if blank
     "short_term_repairs_usd",  # firms that split the near-term bucket by
     "non_critical_repairs_usd",# TIMING and by SEVERITY respectively - the
@@ -286,12 +316,34 @@ SYSTEM_FIELDS = [
                                # against a stated 3,750, which is exactly
                                # 3,750 critical + 32,425 non-critical.
     "replacement_reserves_usd",
+    "source_sections",         # PROVENANCE. The firm's own section numbers and
+                               # headings that were folded into this row, joined
+                               # with "; " - e.g. "3.4 Roofing; 3.5 Roof
+                               # Drainage". Without it the regrouping is
+                               # unauditable: a reviewer looking at a bad
+                               # roofing cost has no way back to the page it
+                               # came from. Costs ~15 output tokens a row and
+                               # is the cheapest insurance in the schema.
+    "notes",                   # <=25 words of the report's own findings for
+                               # this subcategory. The narrative detail that
+                               # the old per-section rows carried implicitly in
+                               # their names, kept in one bounded field.
+    "assessed",                # false when the report does not cover this
+                               # subcategory at all. Distinguishes "not
+                               # assessed" from "assessed and found fine",
+                               # which a null condition alone cannot do and
+                               # which matters to any model reading the column.
 ]
 
 SYSTEM_META = {
+    "subcategory":          {"type": "category",
+                             "allowed": SUBCATEGORIES + [SUBCATEGORY_OTHER]},
     "condition":            {"type": "category", "allowed": CONDITIONS},
     "condition_secondary":  {"type": "category", "allowed": CONDITIONS},
     "condition_rating_numeric": {"type": "number", "min": 1, "max": 5},
+    "rul_years":            {"type": "number", "min": -60, "max": 100},
+    "rul_years_min":        {"type": "number", "min": -60, "max": 100},
+    "rul_years_max":        {"type": "number", "min": -60, "max": 100},
     "immediate_repairs_usd":    {"type": "number", "min": 0, "max": 50_000_000},
     "short_term_repairs_usd":   {"type": "number", "min": 0, "max": 50_000_000},
     "non_critical_repairs_usd": {"type": "number", "min": 0, "max": 50_000_000},
@@ -333,6 +385,18 @@ COMPONENT_FIELDS = [
                             # one due at the same time.
     "section_code",         # "3.4"
     "description",          # "EPDM roof replacement"
+    "subcategory",          # one of taxonomy.SUBCATEGORIES, or "other".
+                            # DERIVED, never extracted: validate.py runs
+                            # taxonomy.subcategory_for_component over
+                            # `description` after coercion. Deriving it costs
+                            # no output tokens, is identical on every re-run,
+                            # and every row's bucket can be traced to the rule
+                            # that assigned it via taxonomy.explain. Asking the
+                            # model for it would be all three of expensive,
+                            # unstable and unauditable.
+                            # This is the join key between components.csv and
+                            # systems.csv: a line item and a condition rating
+                            # finally sit on the same axis.
     "eul_years",            # Table 2 only; null on Table 1 rows
     "eul_years_min", "eul_years_max",      # see RANGE_COMPONENT_FIELDS
     "effective_age_years",  # null when report says "var"/"Varies"
@@ -367,6 +431,8 @@ COMPONENT_FIELDS = [
 ] + YEAR_FIELDS
 
 COMPONENT_META = {
+    "subcategory":         {"type": "category",
+                            "allowed": SUBCATEGORIES + [SUBCATEGORY_OTHER]},
     "table":               {"type": "category",
                             "allowed": ["immediate", "short_term",
                                         "non_critical", "priority",
@@ -426,6 +492,17 @@ def table_horizon(table) -> str:
 
 RANGE_COMPONENT_FIELDS = {
     "eul_years": ("eul_years_min", "eul_years_max"),
+    "rul_years": ("rul_years_min", "rul_years_max"),
+}
+
+# The systems layer gets the SAME treatment, and it is not optional polish.
+# Without it, `rul_years` was coerced by falling through to _num(), which
+# takes the FIRST number in the string - so a report saying "8-12" landed 8 on
+# a systems row and 12 on a component row, because the component path takes
+# the max. Two tables the capex model joins, the same physical quantity, and
+# opposite conventions with nothing to signal it. Caught on the 4-report pilot
+# (Bossier: `systems[5].rul_years: '8-12' -> 8`).
+RANGE_SYSTEM_FIELDS = {
     "rul_years": ("rul_years_min", "rul_years_max"),
 }
 

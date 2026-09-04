@@ -1,6 +1,8 @@
 # PCA-Plus Extraction Agent (observability-first)
 
-Turns PCA report PDFs into three schema-normalized CSVs per report (property, systems, components), tuned to the EBI/ASTM E 2018 report structure. Handles 200+ page reports by slicing to the extractable front section. Cross-table reconciliation validates the tables against the report's own stated totals.
+Turns PCA report PDFs into three schema-normalized CSVs per report (property, systems, components), tuned to the EBI/ASTM E 2018 report structure.
+
+`systems` is a **fixed 12-row block per report** — one row per ASTM E 2018 subcategory (`taxonomy.SUBCATEGORIES`), so it is a feature matrix rather than a ragged list. It replaced a layer keyed on each firm's own section headings, which produced 3,771 rows carrying 1,216 distinct names and could not be pooled across firms. `components` keeps every line item (the timing layer's EUL/age/RUL training data) and carries a derived `subcategory` column on the same 12-value axis, so a line item and a condition rating finally join. Handles 200+ page reports by slicing to the extractable front section. Cross-table reconciliation validates the tables against the report's own stated totals.
 as first-class concerns. LangSmith logs every step; a four-layer validation
 stack catches extractions that are *wrong*, not just *missing* — including
 qualitative fields like condition ratings.
@@ -15,8 +17,10 @@ qualitative fields like condition ratings.
 2. **Grounding** (`validate.py`) — the cited snippet must actually appear on
    the cited page. Free. Catches hallucinated / mis-mapped values.
 3. **Targeted judge** (`judge.py`) — a second model re-reads the PDF, but only
-   for fields that failed 1–2 or came back low-confidence. Scoped so you don't
-   pay to re-judge all ~200 fields every time. Traced.
+   for property fields that failed 1–2 or came back low-confidence, plus up to
+   4 subcategory rows ranked worst-first. Scoped twice over: it judges a
+   handful of values, not ~200, and it is sent the **front block plus the pages
+   extraction cited** rather than the full 90-page extraction slice. Traced.
 
 Clean reports → `data/output/*.csv`. Anything with an unresolved field →
 `data/needs_review/*.csv` + a `.flags.json` explaining why. Nothing wrong slips

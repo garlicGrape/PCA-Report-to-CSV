@@ -797,7 +797,53 @@ def main():
                      or "unversioned"] += 1
             except Exception:
                 vers["unreadable"] += 1
-        print(f"current prompt version: {PROMPT_VERSION}\n")
+        # COVERAGE: which PDFs on disk have no current extraction. This is the
+        # first question after a fresh download of the corpus - "what still
+        # needs extracting" - and answering it by eye across 138 files and 134
+        # cache entries is exactly the kind of manual reconciliation that gets
+        # a report quietly missed.
+        folder = Path(args.folder).expanduser()
+        todo, stale, cached_ids = [], [], set()
+        if folder.exists():
+            pdfs, _ = _dedupe(_real_pdfs(folder))
+            for pdf in pdfs:
+                pid = _property_id(pdf.stem)
+                f = CACHE / "raw" / f"{pid}.json"
+                if not f.exists():
+                    todo.append(pdf.name)
+                    continue
+                try:
+                    v = json.loads(f.read_text()).get("_prompt_version")
+                except Exception:
+                    v = None
+                (cached_ids.add(pid) if v == PROMPT_VERSION
+                 else stale.append(f"{pdf.name}  [{v or 'unversioned'}]"))
+            print(f"\nCOVERAGE of {folder}")
+            print(f"  {len(pdfs)} unique report(s) after de-duplication")
+            print(f"  {len(cached_ids)} already extracted on the current prompt")
+            print(f"  {len(todo)} never extracted")
+            for n in todo[:25]:
+                print(f"      NEW    {n}")
+            print(f"  {len(stale)} extracted under a DIFFERENT prompt "
+                  f"(re-running will redo only these)")
+            for n in stale[:25]:
+                print(f"      STALE  {n}")
+            orphan = sorted({f.stem for f in (CACHE / "raw").glob("*.json")}
+                            - {_property_id(p_.stem) for p_ in pdfs})
+            if orphan:
+                print(f"  {len(orphan)} cached extraction(s) with NO PDF on "
+                      f"disk (cannot be re-extracted):")
+                for n in orphan:
+                    print(f"      NO PDF {n}")
+            est = len(todo) + len(stale)
+            if est:
+                print(f"\n  Re-running `python batch.py {args.folder} "
+                      f"--workers 4 --include-flagged` would extract {est} "
+                      f"report(s), about ${est * 0.6:.0f} and "
+                      f"{est * 160 / 4 / 60:.0f} min at 4 workers. Everything "
+                      f"else is reused for free.")
+
+        print(f"\ncurrent prompt version: {PROMPT_VERSION}\n")
         print(f"{len(raw)} cached extraction(s):")
         for v, n in vers.most_common():
             mark = "  <- current" if v == PROMPT_VERSION else ""

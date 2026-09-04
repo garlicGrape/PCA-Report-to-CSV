@@ -31,7 +31,121 @@ validated output directly.
 Component physics generalizes across regions; unit cost does not. That split is the scalability argument for faculty.
 
 ---
-## Current state (31 Aug 2026) — THE WHOLE CORPUS IS EXTRACTED
+## CURRENT STATE (4 Sep 2026) — READ THIS FIRST, IT SUPERSEDES THE 31 AUG SECTION BELOW
+
+**The whole corpus was re-extracted from scratch under one frozen prompt
+(`4f122f84a717`) and the schema changed. The 31 Aug state below is history.**
+
+| | |
+|---|---|
+| Reports in `data/aggregate/` | **135** |
+| Extracted this session under the frozen prompt | 132 |
+| `unversioned` (no source PDF, could not be re-extracted) | 3 |
+| `extraction_status` | 74 clean / 61 needs_review |
+| **`target_quality`** (use this for capex training) | **108 ok** / 19 no_line_items / 8 does_not_tie |
+
+Outputs: `properties.csv` (135 x 64), `systems.csv` (1,620 = 135 x 12),
+`components.csv` (2,456 x 39), **`capex_by_subcategory.csv` (1,620 x 15)**,
+`extracted_reports.csv` (the roster by PDF filename), `manifest.csv`, plus
+parquet and the `firm=`/`state=` S3 layout. `data/aggregate/README.md` is a
+GENERATED data dictionary - regenerate it with `python make_data_dictionary.py`
+rather than hand-editing, because the hand-written numbers used to drift.
+
+A zip for sharing: `data/aggregate/pca_capex_dataset_2026-09-04.zip` (2.5MB).
+
+### What changed this session
+
+1. **The systems layer is now 12 fixed rows per report.** See the
+   "12-subcategory consolidation" section immediately below for the full
+   rationale. Short version: 3,771 ragged rows carrying 1,216 distinct
+   `system_name` strings became a 135 x 12 feature matrix. `components.csv`
+   is untouched in grain and gained a derived `subcategory` on the same axis.
+2. **`capex_by_subcategory.csv` is new and is the modelling table.** Target is
+   summed from components, NOT from the systems money columns.
+3. **`target_quality` is new and is the filter to use for capex work.**
+   `extraction_status` aggregates the whole validation stack; 34 of the 61
+   needs_review reports carry only systems- or property-layer flags and their
+   capex target is fine. Filtering on `clean` throws away a quarter of the
+   usable training set for problems that are not in the label.
+4. **`PROMPT_VERSION` makes runs resumable and provenance checkable.**
+   `python batch.py --prompt-audit` now also reports COVERAGE: which PDFs on
+   disk have no current extraction, which are stale, which cached records have
+   no PDF, and what a re-run would cost.
+5. **Four silent-corruption bugs fixed** - see the consolidation section.
+
+### THE NEXT TASK (owner is re-downloading the corpus)
+
+The owner is re-downloading all the PCA reports. When they land:
+
+```bash
+python batch.py --prompt-audit          # what is NEW, STALE, or has NO PDF
+python batch.py data/inbox --workers 4 --include-flagged
+```
+
+The audit tells you exactly what needs extracting before you spend anything.
+The run then extracts ONLY the new and stale reports - everything matching the
+current prompt stamp is reused for free - so re-running over the full corpus
+after adding a handful of PDFs costs only those PDFs.
+
+**Specifically wanted: the 3 reports with no PDF on disk.** `Mariella of Sage
+Spring`, `Mission Springs`, `Wickliffe` exist only as cached extractions from
+an older prompt. If their PDFs appear in the re-download, they will be picked
+up automatically and all 135 will finally share one prompt. Name them so the
+id matches, or they will be treated as new reports and duplicate the old ones:
+
+| needed `property_id` | any of these filenames works |
+|---|---|
+| `Mariella_of_Sage_Spring_PCR_2023` | `Mariella of Sage Spring - PCR 2023.pdf` |
+| `Mission_Springs_PCR_2015` | `Mission Springs - PCR 2015.pdf` |
+| `Wickliffe_Property_Condition_Evaluation_2023` | `Wickliffe Property Condition Evaluation 2023.pdf` |
+
+(`_property_id` collapses every non-alphanumeric run to `_`, so punctuation
+does not matter - the words and their order do.)
+
+After any run that adds reports, rebuild the shareable outputs:
+
+```bash
+python batch.py --revalidate --include-flagged   # free; applies validator fixes
+python make_data_dictionary.py                   # regenerate the dictionary
+python report_extraction.py                      # regenerate the roster
+```
+
+### Open items
+
+- **The 3 missing PDFs** (above). Until they arrive, 3 of 135 reports are
+  `prompt_version='unversioned'` and should be filtered out of any analysis
+  whose headline is cross-firm generalisation.
+- **`needs_review` is 61, up from ~39 historically, and that is the fix
+  working.** Reconciliation now runs on the final post-judge record instead of
+  a stale pre-judge one (see the bug list below), so it catches tie-out
+  failures the old runs silently missed. Do not "fix" this by reverting it.
+- **`condition` is still not usable as a numeric feature.** Only
+  excellent/good/fair/poor are rank-ordered; `average`, `functional`,
+  `adequate` are carried verbatim and deliberately unranked.
+- **`rul_years` is sparse** - 155 of 1,620 systems rows. It populates only
+  where a report states it outright.
+- **Batch API is still untouched** and is still the largest remaining saving:
+  a flat 50% on everything, and nothing in this pipeline is latency-sensitive.
+  It needs the per-PDF flow (extract A -> extract B -> validate -> judge)
+  restructured into three corpus-wide phases keyed by `custom_id`.
+- **Local backups** `data/cache/raw_backup_pre12cat/` (5.3MB) and
+  `data/aggregate_pre_reextract/` (6.1MB) hold the pre-session state. Delete
+  when confident.
+
+### Cost and duration of the 4 Sep run
+
+132 reports, 4 workers, ~2h20m wall clock, 1 transient `overloaded_error`
+(recovered on a resume pass that reused the other 131 for free). Roughly $80.
+Per-report cost is ~$0.60: ~$0.48 extraction + ~$0.13 judge.
+
+---
+
+## Current state (31 Aug 2026) — SUPERSEDED, KEPT FOR HISTORY
+
+> Everything below this heading describes the corpus BEFORE the
+> 4 Sep re-extraction. The schema, the row counts and the clean/
+> needs_review split have all changed. Read the 4 Sep section above
+> for current state; read this only for how the corpus got here.
 
 **131 of the 132 corpus reports have been extracted, plus the 3 originals that
 are not in the inbox = 134 cached extractions.** The CSVs are built. The open
@@ -158,6 +272,46 @@ spans plumbing and electrical, and belongs cleanly to neither — forcing it int
 building systems at all. These are dropped from the systems block and counted
 in the coverage report `verify_offline.py` prints every run.
 
+### Four silent-corruption bugs found and fixed during the 4 Sep run
+
+None of these were in the extraction. All four produced output that LOOKED
+fine, which is why they are worth remembering.
+
+1. **Reconciliation was computed before the judge ran, and never recomputed.**
+   `process_one` re-ran `deterministic_checks` after judging and coercion -
+   with a comment explaining exactly why - but not `reconciliation_checks`. So
+   a judge correction could break a report's tie-out and the report would
+   still be reported clean. Measured on ARIUM Apartments: the judge raised
+   `building_envelope` reserves from 420,942 to 585,942, putting the systems
+   sum 165,000 over the report's own stated total, and the run called it
+   clean. **Six reports were clean for this reason alone.** Fixed by
+   recomputing `recon` alongside `det`.
+
+2. **A failed parquet write left the stale file in place.** `renovation_years`
+   holds "1985; 2018" on one report and 1985 on the next; Arrow refused the
+   mixed object column, the write failed, and a **4-row parquet from the pilot
+   sat beside a 131-row CSV** with nothing saying so. Fixed by casting mixed
+   columns (`_parquet_safe`) and by DELETING the stale file when a write
+   fails - a parquet that disagrees with its CSV is worse than no parquet.
+
+3. **S3 partitions accumulated instead of rebuilding.** Partition paths derive
+   from the firm slug, so when firm normalisation changed
+   ("Terracon Consultants, Inc." -> "Terracon") the old partition was orphaned,
+   not overwritten, and kept serving stale rows to anything globbing the tree.
+   11 such files were nearly shipped. `write_outputs` now `rmtree`s `s3/`
+   first.
+
+4. **Filler rows had a null `property_id` and vanished.** `_stamp_keys` runs
+   BEFORE the legacy systems migration, so rows `_normalise_systems` creates
+   for subcategories a report never covered were never stamped, and
+   `groupby("property_id")` silently dropped them. Caught only because
+   132 x 12 + 3 x 11 did not equal the 1,620 rows in the file. Fixed with
+   `_backfill_join_keys`, which runs unconditionally.
+
+**The lesson worth carrying:** every one of these was found by an arithmetic
+identity failing (row counts not multiplying out, a sum not matching), not by
+anything looking wrong. Check the identities.
+
 ### Cost
 
 The consolidation cuts call A's output; the judge changes cut its input. The
@@ -213,19 +367,34 @@ three corpus-wide phases keyed by `custom_id`.
     uv sync                 # or: pip install -r requirements.txt
     cp .env.example .env    # then fill in ANTHROPIC_API_KEY + LANGSMITH_API_KEY
 
-**The three commands that matter**
+**The commands that matter** (updated 4 Sep)
 
-    uv run python verify_offline.py           # re-validate everything, $0, ~2 min
-    uv run python batch.py --aggregate-only --include-flagged   # write the CSVs
-    uv run python batch.py "data/inbox/PCA Reports" --workers 3 --no-judge  # COSTS MONEY
+    python batch.py --prompt-audit                       # $0 - what needs extracting, and what it will cost
+    python batch.py --revalidate --include-flagged       # $0 - re-validate + rebuild every table
+    python make_data_dictionary.py                       # $0 - regenerate data/aggregate/README.md
+    python report_extraction.py                          # $0 - regenerate the roster by PDF name
+    python batch.py data/inbox --workers 4 --include-flagged   # COSTS MONEY (~$0.60/report)
+
+The paid run is now **resumable and incremental**: reports whose cached
+extraction matches the current `PROMPT_VERSION` are reused for free, so this
+command after adding a few PDFs costs only those PDFs. Run `--prompt-audit`
+first; it tells you exactly how many reports will actually be extracted.
 
 **Rules of the road**
 - **`data/cache/raw/` is the expensive asset.** ~$120 of extraction lives
   there. Never delete it. Three of those reports have no PDF in the repo at
   all, so they are irreplaceable.
-- **Validator changed? Run `verify_offline.py`, not `batch.py`.** Deleting
-  `data/cache/*.json` and re-running re-fires the judge on all 132 reports and
-  re-uploads every PDF. That is what exhausted the API credits.
+- **Validator changed? Run `batch.py --revalidate`, NOT `verify_offline.py`.**
+  This rule inverted on 4 Sep and getting it wrong destroys work.
+  `verify_offline.py` reads `data/cache/raw/`, which is the extraction BEFORE
+  the judge ran, so every correction the judge made is silently rolled back.
+  `--revalidate` re-runs the free validation stack over the POST-judge record
+  in `data/cache/*.json` and rebuilds the tables. Either way, never delete
+  `data/cache/*.json` and re-run `batch.py` to pick up a validator change -
+  that re-fires the judge on every report and re-uploads every PDF, which is
+  what exhausted the API credits in August.
+- **`verify_offline.py` still has one job:** validating from raw extractions
+  when there is no judged record to preserve (e.g. after restoring a backup).
 - **Nothing in `data/` is committed** and it must stay that way - the PDFs and
   every table derived from them carry client addresses and financials. See
   `.gitignore`; a `git add -A` used to stage 1,097 paths of client data and
